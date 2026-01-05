@@ -1,11 +1,11 @@
+import time
 import json
 import logging
-import time
-
 from llama_cpp import Llama
 
+# 配置日志
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Engine")
-logger.setLevel(logging.INFO)
 
 
 class ChainedEngine:
@@ -18,111 +18,116 @@ class ChainedEngine:
 
     def __init__(self, model_path):
         if not hasattr(self, 'llm'):
-            print(f">>> [Engine] Loading Model: {model_path}...")
+            print(f">>> [Init] Loading LLM: {model_path}...")
             self.llm = Llama(
                 model_path=model_path,
-                n_ctx=2048,
-                n_gpu_layers=-1,  # Mac M1 Metal 加速
-                verbose=False
+                n_ctx=4096,  # 加大上下文窗口，确保能装下长 Prompt
+                n_gpu_layers=-1,  # 开启 Metal 加速
+                verbose=True  # 开启日志，方便看底层有没有报错
             )
             self._init_prompts()
-            print(">>> [Engine] Model Loaded.")
+            print(">>> [Init] Engine Loaded.")
 
     def _init_prompts(self):
-        """定义所有 Prompt 模板"""
+        # ==========================================
+        # Layer 1: 强力路由 Prompt (All-in-One)
+        # 核心技巧：用【示例】代替【定义】，1.5B 模型模仿能力强，理解能力弱
+        # ==========================================
+        self.router_prompt = """你是一个智能搜索路由。
+        请分析用户输入，将其归类为以下核心领域之一。
+        如果无法归类到特定领域，或者只是查询普通信息，请归类为 WEB_SEARCH。
 
-        # --- Layer 1: 路由器 ---
-        # 目标: 极速分类
-        self.router_prompt = """你是一个意图分类器。
-用户输入属于以下哪一类？只输出类别代码，不要解释。
-1. RECRUIT (招聘/找工作/查薪资)
-2. ECOMMERCE (买东西/查商品)
-3. CHAT (闲聊/无意义/其他)
+        核心领域 (需要结构化):
+        1. ECOMMERCE: (电商) 买东西, 查价格, 品牌, 产品推荐
+        2. LOCAL: (本地生活) 找餐厅, 酒店, 景点, 导航, 附近
+        3. MEDIA: (影音书) 找电影, 听歌, 找小说, 电视剧
+        4. CHAT: (闲聊) 打招呼, 情感交流, 无意义语句
 
-示例:
-"找个java工作" -> RECRUIT
-"苹果手机多少钱" -> ECOMMERCE
-"你好" -> CHAT
-"""
+        通用兜底 (不需要结构化):
+        5. WEB_SEARCH: (通用搜索) 新闻, 历史, 百科, 教程, 怎么做(非菜谱), 为什么, 是什么, 以及所有不属于上述类别的内容
 
-        # --- Layer 2: 垂直专家 ---
+        示例:
+        "买个好用的吹风机" -> ECOMMERCE
+        "附近的火锅店" -> LOCAL
+        "周杰伦的歌" -> MEDIA
+        "你好" -> CHAT
+        "感冒了怎么办" -> WEB_SEARCH  (医疗建议归为通用搜索)
+        "特朗普最新新闻" -> WEB_SEARCH (新闻归为通用搜索)
+        "相对论是谁提出的" -> WEB_SEARCH (百科归为通用搜索)
+        "红烧肉怎么做" -> WEB_SEARCH (菜谱如果没做垂直域，就归为通用)
+
+        只输出分类代码，不要解释。
+        User: "{query}" -> """
+
+        # ==========================================
+        # Layer 2: 垂直专家 Prompt
+        # ==========================================
         self.expert_prompts = {
-            "RECRUIT": """你是一个招聘搜索专家。
-请提取: city(城市), job(职位), salary(薪资), exp(经验)。
-输出 JSON。
-示例: "上海3年经验Java" -> {"city":"上海", "job":"Java", "exp":"3年"}""",
-
-            "ECOMMERCE": """你是一个电商搜索专家。
-请提取: category(品类), brand(品牌), price(价格), color(颜色)。
-输出 JSON。
-示例: "200元左右的红色口红" -> {"category":"口红", "price":"200元", "color":"红色"}"""
+            "RECRUIT": "你是一个招聘专家。提取: city, job, salary, exp。如果用户未提及某字段，请填空字符串。输出JSON。示例: '上海3年Java' -> {\"city\":\"上海\", \"job\":\"Java\", \"exp\":\"3年\"}",
+            "ECOMMERCE": "你是一个电商专家。提取: category, brand, price, color。如果用户未提及某字段，请填空字符串。输出JSON。示例: '200元红色口红' -> {\"category\":\"口红\", \"price\":\"200元\", \"color\":\"红色\"}",
+            "CODING": "你是一个编程助手。提取: language, framework, error。如果用户未提及某字段，请填空字符串。输出JSON。",
+            "RECIPE": "你是一个大厨。提取: dish(菜名), ingredient(食材)。如果用户未提及某字段，请填空字符串。输出JSON。"
         }
 
     def predict(self, query: str) -> dict:
         start_time = time.time()
 
-        # ===========================
-        # Step 1: Layer 1 (Router)
-        # ===========================
-        router_messages = [
-            {"role": "system", "content": self.router_prompt},
-            {"role": "user", "content": query}
-        ]
+        # --- Step 1: Layer 1 Router ---
+        # 直接利用 f-string 构造完整 Prompt
+        final_router_prompt = self.router_prompt.replace("{query}", query)
 
-        # 技巧: max_tokens=5 限制输出长度，强制模型快速结束
-        router_out = self.llm.create_chat_completion(
-            messages=router_messages,
-            temperature=0.1,
-            max_tokens=10
+        # 技巧: max_tokens=5, stop=["\n"], temperature=0
+        # 极致限制模型的发挥空间，让它只能吐出代码
+        router_out = self.llm(
+            final_router_prompt,
+            max_tokens=10,
+            stop=["\n"],
+            temperature=0.0,  # 绝对理性，不要随机
+            echo=False
         )
 
-        # 清洗结果 (模型可能输出 "类别: RECRUIT"，我们只要 "RECRUIT")
-        raw_intent = router_out['choices'][0]['message']['content'].strip()
-        intent_category = "CHAT"  # 默认兜底
+        raw_intent = router_out['choices'][0]['text'].strip().upper()
 
-        if "RECRUIT" in raw_intent.upper():
-            intent_category = "RECRUIT"
-        elif "ECOMMERCE" in raw_intent.upper():
-            intent_category = "ECOMMERCE"
+        # 清洗结果: 只要是咱们定义的词，包含就算命中
+        final_intent = "CHAT"
+        valid_intents = ["RECRUIT", "ECOMMERCE", "CODING", "RECIPE", "CHAT"]
 
-        print(f"   [Layer 1] Router: {intent_category}")
+        for valid in valid_intents:
+            if valid in raw_intent:
+                final_intent = valid
+                break
 
-        # ===========================
-        # Step 2: Layer 2 (Expert)
-        # ===========================
+        print(f"   [Layer 1] Input: {query} | Output: {raw_intent} | Decision: {final_intent}")
+
+        # --- Step 2: Layer 2 Expert ---
         entities = {}
 
-        # Early Exit: 如果是闲聊，直接跳过 L2，省时间！
-        if intent_category == "CHAT":
+        # Early Exit
+        if final_intent == "CHAT":
             pass
-
-        elif intent_category in self.expert_prompts:
-            expert_sys_prompt = self.expert_prompts[intent_category]
-
-            expert_messages = [
-                {"role": "system", "content": expert_sys_prompt},
+        elif final_intent in self.expert_prompts:
+            sys_prompt = self.expert_prompts[final_intent]
+            messages = [
+                {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": query}
             ]
 
-            # 技巧: 强制 JSON 模式
             expert_out = self.llm.create_chat_completion(
-                messages=expert_messages,
+                messages=messages,
                 temperature=0.1,
                 max_tokens=200,
                 response_format={"type": "json_object"}
             )
-
             try:
-                raw_json = expert_out['choices'][0]['message']['content']
-                entities = json.loads(raw_json)
-                print(f"   [Layer 2] Expert: {entities}")
+                entities = json.loads(expert_out['choices'][0]['message']['content'])
+                print(f"   [Layer 2] Extracted: {entities}")
             except:
-                print("   [Layer 2] JSON Parse Failed")
+                print("   [Layer 2] JSON Parse Error")
 
         latency = int((time.time() - start_time) * 1000)
 
         return {
-            "intent": intent_category,
+            "intent": final_intent,
             "entities": entities,
             "latency": latency
         }
