@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package llm.intent.v1;
+
+service IntentService {
+  rpc Analyze (AnalyzeRequest) returns (AnalyzeResponse);
+}
+
+message AnalyzeRequest {
+  string query = 1;
+}
+
+message AnalyzeResponse {
+  // Layer 1 的结果: 大类意图 (JOB, ECOMMERCE, CHAT...)
+  string intent_category = 1;
+
+  // Layer 2 的结果: 结构化实体 (JSON 字符串形式返回，Java端再解析，灵活性更高)
+  string entities_json = 2;
+
+  // 耗时 (毫秒)
+  int32 latency_ms = 3;
+}
