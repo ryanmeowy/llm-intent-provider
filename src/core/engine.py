@@ -1,22 +1,14 @@
 import time
 import json
 import logging
-import torch
 from llama_cpp import Llama
-from sentence_transformers import SentenceTransformer, util
 
 # 配置日志
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Engine")
-logger.setLevel(logging.INFO)
 
 
 class ChainedEngine:
-    """
-    核心引擎类 (单例模式)
-    包含:
-    1. 向量模型 (all-MiniLM-L6-v2) -> 用于 Layer 1 粗排
-    2. 大语言模型 (Qwen2.5-1.5B)   -> 用于 Layer 1 决策 + Layer 2 提取
-    """
     _instance = None
 
     def __new__(cls, *args, **kwargs):
@@ -25,160 +17,112 @@ class ChainedEngine:
         return cls._instance
 
     def __init__(self, model_path):
-        # 防止重复初始化
         if not hasattr(self, 'llm'):
-            print(">>> [Init] 正在初始化引擎，请稍候...")
-
-            # --- 1. 加载 LLM (Qwen) ---
-            print(f"   - Loading LLM: {model_path}...")
+            print(f">>> [Init] Loading LLM: {model_path}...")
             self.llm = Llama(
                 model_path=model_path,
-                n_ctx=2048,
-                n_gpu_layers=-1,  # Mac Metal 加速 / Linux CPU
-                verbose=False
+                n_ctx=4096,  # 加大上下文窗口，确保能装下长 Prompt
+                n_gpu_layers=-1,  # 开启 Metal 加速
+                verbose=True  # 开启日志，方便看底层有没有报错
             )
+            self._init_prompts()
+            print(">>> [Init] Engine Loaded.")
 
-            # --- 2. 加载向量模型 (用于意图检索) ---
-            print("   - Loading Embedding Model (all-MiniLM-L6-v2)...")
-            # 首次运行会自动下载约 80MB 的模型文件
-            self.embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+    def _init_prompts(self):
+        # ==========================================
+        # Layer 1: 强力路由 Prompt (All-in-One)
+        # 核心技巧：用【示例】代替【定义】，1.5B 模型模仿能力强，理解能力弱
+        # ==========================================
+        self.router_prompt = """你是一个智能搜索路由。
+        请分析用户输入，将其归类为以下核心领域之一。
+        如果无法归类到特定领域，或者只是查询普通信息，请归类为 WEB_SEARCH。
 
-            # --- 3. 初始化意图库 (定义通用场景) ---
-            self._init_intent_database()
+        核心领域 (需要结构化):
+        1. ECOMMERCE: (电商) 买东西, 查价格, 品牌, 产品推荐
+        2. LOCAL: (本地生活) 找餐厅, 酒店, 景点, 导航, 附近
+        3. MEDIA: (影音书) 找电影, 听歌, 找小说, 电视剧
+        4. CHAT: (闲聊) 打招呼, 情感交流, 无意义语句
 
-            # --- 4. 初始化专家 Prompt ---
-            self._init_expert_prompts()
+        通用兜底 (不需要结构化):
+        5. WEB_SEARCH: (通用搜索) 新闻, 历史, 百科, 教程, 怎么做(非菜谱), 为什么, 是什么, 以及所有不属于上述类别的内容
 
-            print(">>> [Init] 引擎初始化完成!")
+        示例:
+        "买个好用的吹风机" -> ECOMMERCE
+        "附近的火锅店" -> LOCAL
+        "周杰伦的歌" -> MEDIA
+        "你好" -> CHAT
+        "感冒了怎么办" -> WEB_SEARCH  (医疗建议归为通用搜索)
+        "特朗普最新新闻" -> WEB_SEARCH (新闻归为通用搜索)
+        "相对论是谁提出的" -> WEB_SEARCH (百科归为通用搜索)
+        "红烧肉怎么做" -> WEB_SEARCH (菜谱如果没做垂直域，就归为通用)
 
-    def _init_intent_database(self):
-        """
-        定义 Layer 1 的意图库。
-        'code': 意图代码
-        'desc': 给向量模型看的描述，用来匹配用户 Query
-        """
-        self.intent_db = [
-            {"code": "RECRUIT", "desc": "招聘, 找工作, 查薪资, 面试, 职位要求, 招聘网站, 招人, 简历"},
-            {"code": "ECOMMERCE", "desc": "买东西, 商品价格, 推荐产品, 购物, 便宜的, 性价比, 多少钱, 哪里买"},
-            {"code": "CODING", "desc": "写代码, 编程报错, Python教程, Java异常, 算法逻辑, 开发文档, 数据库"},
-            {"code": "NAVIGATIONAL", "desc": "去哪里, 怎么走, 附近的餐厅, 地图导航, 酒店预订, 旅游攻略"},
-            {"code": "RECIPE", "desc": "怎么做菜, 食谱, 好吃的做法, 烹饪教程, 烘焙, 食材处理"},
-            {"code": "MEDICAL", "desc": "感冒了吃什么药, 医院挂号, 身体不舒服, 症状分析, 养生, 医生"},
-            {"code": "CHAT", "desc": "你好, 闲聊, 讲个笑话, 无论什么话题都可以聊, 打招呼"},
-        ]
+        只输出分类代码，不要解释。
+        User: "{query}" -> """
 
-        # 预计算意图库的向量 (Cache)
-        # 类似于 Java 的 List<Float[]>
-        print("   - Indexing Intent Database...")
-        descriptions = [item["desc"] for item in self.intent_db]
-        self.db_vectors = self.embed_model.encode(descriptions, convert_to_tensor=True)
-
-    def _init_expert_prompts(self):
-        """定义 Layer 2 的垂直领域提取规则"""
+        # ==========================================
+        # Layer 2: 垂直专家 Prompt
+        # ==========================================
         self.expert_prompts = {
-            "RECRUIT": "你是一个招聘搜索专家。请提取: city(城市), job(职位), salary(薪资), exp(经验)。输出 JSON。",
-            "ECOMMERCE": "你是一个电商搜索专家。请提取: category(品类), brand(品牌), price(价格), color(颜色)。输出 JSON。",
-            "CODING": "你是一个编程助手。请提取: language(语言), framework(框架), error_msg(错误信息)。输出 JSON。",
-            "RECIPE": "你是一个大厨。请提取: dish(菜名), ingredient(食材)。输出 JSON。",
-            "MEDICAL": "你是一个医生。请提取: symptom(症状), medicine(药品)。输出 JSON。"
+            "RECRUIT": "你是一个招聘专家。提取: city, job, salary, exp。如果用户未提及某字段，请填空字符串。输出JSON。示例: '上海3年Java' -> {\"city\":\"上海\", \"job\":\"Java\", \"exp\":\"3年\"}",
+            "ECOMMERCE": "你是一个电商专家。提取: category, brand, price, color。如果用户未提及某字段，请填空字符串。输出JSON。示例: '200元红色口红' -> {\"category\":\"口红\", \"price\":\"200元\", \"color\":\"红色\"}",
+            "CODING": "你是一个编程助手。提取: language, framework, error。如果用户未提及某字段，请填空字符串。输出JSON。",
+            "RECIPE": "你是一个大厨。提取: dish(菜名), ingredient(食材)。如果用户未提及某字段，请填空字符串。输出JSON。"
         }
 
-    def _get_top_k_intents(self, query: str, k=3):
-        """
-        Layer 1 核心逻辑: 向量检索
-        输入 Query -> 找出最相似的 k 个意图
-        """
-        # 1. 把用户 Query 转成向量
-        query_vec = self.embed_model.encode(query, convert_to_tensor=True)
-
-        # 2. 计算相似度 (Cosine Similarity)
-        cos_scores = util.cos_sim(query_vec, self.db_vectors)[0]
-
-        # 3. 取前 k 名
-        top_results = torch.topk(cos_scores, k=min(k, len(self.intent_db)))
-
-        candidates = []
-        for score, idx in zip(top_results[0], top_results[1]):
-            item = self.intent_db[idx]
-            candidates.append({
-                "code": item["code"],
-                "desc": item["desc"]
-            })
-        return candidates
-
     def predict(self, query: str) -> dict:
-        """主入口: 执行两层识别"""
         start_time = time.time()
 
-        # ==========================================
-        # Step 1: Layer 1 (动态路由)
-        # ==========================================
+        # --- Step 1: Layer 1 Router ---
+        # 直接利用 f-string 构造完整 Prompt
+        final_router_prompt = self.router_prompt.replace("{query}", query)
 
-        # 1.1 先用小模型(向量)筛选出 3 个候选者
-        candidates = self._get_top_k_intents(query, k=3)
-        candidate_codes = [c['code'] for c in candidates]
-        print(f"   [Layer 1] Vector Search Candidates: {candidate_codes}")
-
-        # 1.2 动态组装 Prompt
-        options_text = "\n".join([f"- {c['code']}: {c['desc']}" for c in candidates])
-
-        router_prompt = f"""你是一个意图分类器。
-请从以下候选列表中，选择最匹配用户输入的一个意图代码。
-
-候选列表:
-{options_text}
-
-输入: "{query}"
-只输出意图代码，不要解释。
-"""
-
-        # 1.3 LLM 做最终裁决
-        router_msg = [{"role": "user", "content": router_prompt}]
-        router_out = self.llm.create_chat_completion(
-            messages=router_msg, temperature=0.1, max_tokens=10
+        # 技巧: max_tokens=5, stop=["\n"], temperature=0
+        # 极致限制模型的发挥空间，让它只能吐出代码
+        router_out = self.llm(
+            final_router_prompt,
+            max_tokens=10,
+            stop=["\n"],
+            temperature=0.0,  # 绝对理性，不要随机
+            echo=False
         )
 
-        raw_intent = router_out['choices'][0]['message']['content'].strip().upper()
+        raw_intent = router_out['choices'][0]['text'].strip().upper()
 
-        # 简单清洗: 确保 LLM 输出的是我们候选列表里的词
-        final_intent = "CHAT"  # 兜底
-        for code in candidate_codes:
-            if code in raw_intent:
-                final_intent = code
+        # 清洗结果: 只要是咱们定义的词，包含就算命中
+        final_intent = "CHAT"
+        valid_intents = ["RECRUIT", "ECOMMERCE", "CODING", "RECIPE", "CHAT"]
+
+        for valid in valid_intents:
+            if valid in raw_intent:
+                final_intent = valid
                 break
 
-        print(f"   [Layer 1] LLM Decision: {final_intent}")
+        print(f"   [Layer 1] Input: {query} | Output: {raw_intent} | Decision: {final_intent}")
 
-        # ==========================================
-        # Step 2: Layer 2 (专家提取)
-        # ==========================================
+        # --- Step 2: Layer 2 Expert ---
         entities = {}
 
-        # Early Exit: 闲聊或导航类通常不需要复杂提取，直接跳过以节省时间
-        skip_layer_2 = final_intent in ["CHAT", "NAVIGATIONAL"]
-
-        if not skip_layer_2 and final_intent in self.expert_prompts:
+        # Early Exit
+        if final_intent == "CHAT":
+            pass
+        elif final_intent in self.expert_prompts:
             sys_prompt = self.expert_prompts[final_intent]
-
-            expert_msg = [
+            messages = [
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": query}
             ]
 
-            # 强制 JSON 模式
             expert_out = self.llm.create_chat_completion(
-                messages=expert_msg,
+                messages=messages,
                 temperature=0.1,
                 max_tokens=200,
                 response_format={"type": "json_object"}
             )
-
             try:
-                json_str = expert_out['choices'][0]['message']['content']
-                entities = json.loads(json_str)
+                entities = json.loads(expert_out['choices'][0]['message']['content'])
                 print(f"   [Layer 2] Extracted: {entities}")
             except:
-                print("   [Layer 2] JSON Parse Failed")
+                print("   [Layer 2] JSON Parse Error")
 
         latency = int((time.time() - start_time) * 1000)
 

@@ -14,7 +14,8 @@ def run():
     test_cases = [
         "你好啊",                          # 期望: CHAT (Fast)
         "帮我找个上海的算法工程师",          # 期望: RECRUIT (Slow, Structured)
-        "推荐个200块钱的机械键盘",           # 期望: ECOMMERCE (Slow, Structured)
+        "推荐个200块钱的机械键盘",          # 期望: ECOMMERCE (Slow, Structured)
+        "感冒了怎么办"
     ]
 
     for q in test_cases:
