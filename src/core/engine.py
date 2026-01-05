@@ -27,36 +27,41 @@ class ChainedEngine:
             )
             self._init_prompts()
             print(">>> [Engine] Model Loaded.")
-
     def _init_prompts(self):
-        """定义所有 Prompt 模板"""
+            """定义所有 Prompt 模板"""
 
-        # --- Layer 1: 路由器 ---
-        # 目标: 极速分类
-        self.router_prompt = """你是一个意图分类器。
-用户输入属于以下哪一类？只输出类别代码，不要解释。
-1. RECRUIT (招聘/找工作/查薪资)
-2. ECOMMERCE (买东西/查商品)
-3. CHAT (闲聊/无意义/其他)
+            # --- Layer 1: 路由器 (增强版) ---
+            # 优化点: 增加了 Few-Shot 示例，明确了"推荐"在不同场景下的归属
+            self.router_prompt = """你是一个意图分类器。
+    请将用户输入归类为以下三类之一：
+    1. RECRUIT (招聘/找工作/查薪资/招人)
+    2. ECOMMERCE (电商/买东西/查商品/推荐产品)
+    3. CHAT (闲聊/无意义/其他)
 
-示例:
-"找个java工作" -> RECRUIT
-"苹果手机多少钱" -> ECOMMERCE
-"你好" -> CHAT
-"""
+    示例:
+    "找个java工作" -> RECRUIT
+    "苹果手机多少钱" -> ECOMMERCE
+    "你好" -> CHAT
+    "帮我推荐个好用的鼠标" -> ECOMMERCE
+    "推荐几个靠谱的简历" -> RECRUIT
+    "200元能买什么" -> ECOMMERCE
+    "20k能招到人吗" -> RECRUIT
 
-        # --- Layer 2: 垂直专家 ---
-        self.expert_prompts = {
-            "RECRUIT": """你是一个招聘搜索专家。
-请提取: city(城市), job(职位), salary(薪资), exp(经验)。
-输出 JSON。
-示例: "上海3年经验Java" -> {"city":"上海", "job":"Java", "exp":"3年"}""",
+    只输出类别代码 (RECRUIT, ECOMMERCE, CHAT)，不要解释。
+    """
 
-            "ECOMMERCE": """你是一个电商搜索专家。
-请提取: category(品类), brand(品牌), price(价格), color(颜色)。
-输出 JSON。
-示例: "200元左右的红色口红" -> {"category":"口红", "price":"200元", "color":"红色"}"""
-        }
+            # --- Layer 2: 垂直专家 (保持不变) ---
+            self.expert_prompts = {
+                "RECRUIT": """你是一个招聘搜索专家。
+    请提取: city(城市), job(职位), salary(薪资), exp(经验)。
+    输出 JSON。
+    示例: "上海3年经验Java" -> {"city":"上海", "job":"Java", "exp":"3年"}""",
+
+                "ECOMMERCE": """你是一个电商搜索专家。
+    请提取: category(品类), brand(品牌), price(价格), color(颜色)。
+    输出 JSON。
+    示例: "200元左右的红色口红" -> {"category":"口红", "price":"200元", "color":"红色"}"""
+            }
 
     def predict(self, query: str) -> dict:
         start_time = time.time()

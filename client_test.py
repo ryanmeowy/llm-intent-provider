@@ -1,7 +1,7 @@
-import grpc
-import sys
 import os
-import json
+import sys
+
+import grpc
 
 sys.path.append(os.path.abspath("protos"))
 import protos.intent_pb2 as pb2
